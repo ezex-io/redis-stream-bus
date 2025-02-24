@@ -1,0 +1,20 @@
+[package]
+name = "redis-stream-bus"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+structopt = { version = "0.3", default-features = false }
+redis = { version = "0.29", features = ["streams", "tokio-comp", "connection-manager"] }
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+anyhow = "1.0"
+
+[dev-dependencies]
+simple_logger = "5.0"
+tokio = { version = "1.43", features = ["macros"] }
+# serde-redis = { version = "1.29", git = "https://github.com/ezex-io/serde-redis" }
+serde-redis = { path = "../serde-redis" }
