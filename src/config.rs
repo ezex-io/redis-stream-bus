@@ -1,12 +1,12 @@
-use serde::{Deserialize, Serialize};
-use structopt::StructOpt;
+use clap::Args;
 
-#[derive(Debug, StructOpt, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Args)]
+#[group(id = "redis")]
 pub struct Config {
-    #[structopt(long = "redis-connection-string", env = "REDIS_CONNECTION_STRING")]
+    #[arg(long = "redis-connection-string", env = "REDIS_CONNECTION_STRING")]
     pub connection_string: String,
-    #[structopt(long = "redis-group-name", env = "REDIS_GROUP_NAME")]
+    #[arg(long = "redis-group-name", env = "REDIS_GROUP_NAME")]
     pub group_name: String,
-    #[structopt(long = "redis-consumer", env = "REDIS_CONSUMER")]
+    #[arg(long = "redis-consumer-name", env = "REDIS_CONSUMER_NAME")]
     pub consumer_name: String,
 }
