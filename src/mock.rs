@@ -1,7 +1,7 @@
 pub use crate::{bus::StreamBus, stream::Stream};
 use async_trait::async_trait;
-use futures::channel::mpsc::{channel, Receiver, Sender};
-use futures::{select, SinkExt};
+use futures::channel::mpsc::{Receiver, Sender, channel};
+use futures::{SinkExt, select};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};

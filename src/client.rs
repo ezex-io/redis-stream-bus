@@ -1,9 +1,9 @@
 use super::config::Config;
 pub use super::{bus::StreamBus, stream::Stream};
 use async_trait::async_trait;
-use futures::channel::mpsc::{channel, Receiver, Sender};
 use futures::FutureExt;
-use futures::{select, SinkExt};
+use futures::channel::mpsc::{Receiver, Sender, channel};
+use futures::{SinkExt, select};
 use futures_util::StreamExt;
 #[cfg(not(test))]
 use log::{error, info, trace, warn};
@@ -163,11 +163,8 @@ impl StreamBus for RedisClient {
 
                         let mut map = BTreeMap::new();
                         for (k, v) in stream.fields {
-                            match v {
-                                redis::Value::BulkString(d) => {
-                                    map.insert(k, d);
-                                }
-                                _ => {}
+                            if let redis::Value::BulkString(d) = v {
+                                map.insert(k, d);
                             }
                         }
                         match con_add.xadd_map::<_, _, BTreeMap<String, Vec<u8>>, String>(
@@ -222,5 +219,5 @@ async fn register_running<'a>(
         }
         ids.push(">");
     }
-    return ids;
+    ids
 }
