@@ -12,7 +12,6 @@ use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, RedisResult};
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::usize;
 
 #[cfg(test)]
 use std::{println as trace, println as info, println as warn, println as error};
