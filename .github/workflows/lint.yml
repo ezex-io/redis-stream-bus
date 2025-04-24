@@ -1,0 +1,41 @@
+name: Lint and Format Check (Rust)
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: stable
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  linting:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{env.RUST_TOOLCHAIN}}
+          components: clippy, rustfmt
+
+      - name: installing dependencies
+        run: |
+          cargo version
+          sudo apt install -y protobuf-compiler
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: "RUST_TOOLCHAIN=${{env.RUST_TOOLCHAIN}}"
+
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
