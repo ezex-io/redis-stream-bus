@@ -1,5 +1,6 @@
 use super::config::Config;
-pub use super::{bus::StreamBus, stream::Stream};
+use super::{bus::StreamBus, stream::Stream};
+use crate::error::{RedisBusError, Result};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::channel::mpsc::{Receiver, Sender, channel};
@@ -10,7 +11,7 @@ use log::{error, info, trace, warn};
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, RedisResult};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 
 #[cfg(test)]
@@ -37,11 +38,7 @@ pub struct RedisClient {
 }
 
 impl RedisClient {
-    pub fn new(
-        connection_string: &str,
-        group_name: &str,
-        consumer_name: &str,
-    ) -> RedisResult<Self> {
+    pub fn new(connection_string: &str, group_name: &str, consumer_name: &str) -> Result<Self> {
         let client = redis::Client::open(connection_string)?;
         Ok(RedisClient {
             client,
@@ -64,12 +61,79 @@ impl RedisClient {
         self
     }
 
-    pub fn from_config(config: &Config) -> RedisResult<Self> {
+    pub fn from_config(config: &Config) -> Result<Self> {
         Self::new(
             &config.connection_string,
             &config.group_name,
             &config.consumer_name,
         )
+    }
+
+    async fn create_groups<'a>(
+        group_name: &str,
+        keys: &[&'a str],
+        con_read: &mut MultiplexedConnection,
+    ) -> Vec<&'a str> {
+        let mut ids = vec![];
+        for key in keys {
+            let created: RedisResult<()> =
+                con_read.xgroup_create_mkstream(*key, group_name, "$").await;
+
+            match created {
+                Ok(_) => trace!("Group created successfully: {}", group_name),
+                Err(err) => warn!(
+                    "An error occurred when creating a group {:?}: {:?}",
+                    group_name, err
+                ),
+            }
+            ids.push(">");
+        }
+        ids
+    }
+
+    pub(super) fn map_to_value(map: HashMap<String, redis::Value>) -> redis::Value {
+        let mut values = Vec::with_capacity(map.len() * 2);
+        for (key, val) in map {
+            values.push(redis::Value::BulkString(key.into_bytes()));
+            values.push(val);
+        }
+        redis::Value::Array(values)
+    }
+
+    pub(super) fn value_to_map(val: redis::Value) -> Result<BTreeMap<String, Vec<u8>>> {
+        match val {
+            redis::Value::Array(arr) => {
+                let mut map = BTreeMap::new();
+                let mut iter = arr.into_iter();
+                while let Some(redis::Value::BulkString(key_bytes)) = iter.next() {
+                    let key = String::from_utf8(key_bytes)?;
+
+                    match iter.next() {
+                        Some(value) => {
+                            let value_bytes = match value {
+                                redis::Value::BulkString(data) => data,
+                                _ => {
+                                    return Err(RedisBusError::InvalidData(
+                                        "Unsupported Redis Value Type".to_string(),
+                                    ));
+                                }
+                            };
+
+                            map.insert(key, value_bytes);
+                        }
+                        None => {
+                            return Err(RedisBusError::InvalidData(format!(
+                                "Missing Redis Value For {key}"
+                            )));
+                        }
+                    }
+                }
+                Ok(map)
+            }
+            _ => Err(RedisBusError::InvalidData(
+                "Unsupported Redis Key Type".to_string(),
+            )),
+        }
     }
 }
 
@@ -86,7 +150,7 @@ impl StreamBus for RedisClient {
         &mut self,
         keys: &[&'a str],
         read_tx: &'b mut Sender<Stream>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut con_read = self.client.get_multiplexed_async_connection().await?;
         let mut con_add = self.client.get_multiplexed_async_connection().await?;
         let mut con_ack = self.client.get_multiplexed_async_connection().await?;
@@ -96,7 +160,7 @@ impl StreamBus for RedisClient {
             .block(self.timeout)
             .count(self.count);
 
-        let ids = register_running(&self.group_name, keys, &mut con_read).await;
+        let ids = Self::create_groups(&self.group_name, keys, &mut con_read).await;
 
         info!("Started listening on events. on keys: {:?}", keys);
 
@@ -117,8 +181,10 @@ impl StreamBus for RedisClient {
                         Ok(stream) =>{
                             for stream_key in stream.keys {
                                 for stream_id in stream_key.ids {
-                                    let stream = Stream::new(&stream_key.key, Some(stream_id.id), stream_id.map);
-                                    trace!("[>][{}]", &stream.key);
+                                    trace!("[>][{}]: {}", &stream_key.key, stream_id.id);
+
+                                    let fields = Self::map_to_value(stream_id.map);
+                                    let stream = Stream::new(&stream_key.key, Some(stream_id.id), fields);
                                     if let Err(err) = read_tx.send(stream).await {
                                         error!("[!]: {:?}", err);
                                         break;
@@ -127,29 +193,7 @@ impl StreamBus for RedisClient {
                             }
                         },
                         Err (err) => {
-                            error!("[!]: {:?} , CODE:'{:?}'", err,err.code());
-                            match err.code() {
-                                Some("NOGROUP") => {
-                                    log::error!("redis groups not found re-registring them");
-                                    //re-register redis keys
-                                    let conn=&mut self.client.get_multiplexed_async_connection().await?;
-                                    register_running(&self.group_name, keys, conn).await;
-                                    continue;
-                                },
-                                Some("None") => {
-                                    log::error!("reconnecting to redis server");
-                                    anyhow::bail!("reconnecting to redis server")
-                                },
-                                Some(code) => {
-                                    log::error!("connection dropped due to {:?}",&code);
-                                    anyhow::bail!("connection dropped due to {:?}",&code)
-                                },
-                                _ =>  {
-                                    log::error!("connection dropped without any reason");
-                                    anyhow::bail!("connection dropped without any reason")
-                                },
-                            }
-
+                            warn!("[!]: {:?} , CODE:'{:?}'", err,err.code());
                         }
                     }
                 },
@@ -160,13 +204,8 @@ impl StreamBus for RedisClient {
                             None => "*".to_owned(),
                         };
 
-                        let mut map = BTreeMap::new();
-                        for (k, v) in stream.fields {
-                            if let redis::Value::BulkString(d) = v {
-                                map.insert(k, d);
-                            }
-                        }
-                        match con_add.xadd_map::<_, _, BTreeMap<String, Vec<u8>>, String>(
+                       let map = Self::value_to_map(stream.fields)?;
+                       match con_add.xadd_map::<_, _, BTreeMap<String, Vec<u8>>, String>(
                             stream.key.clone(),
                             stream_id,
                             map,
@@ -175,8 +214,7 @@ impl StreamBus for RedisClient {
                                 trace!("[<][{}]: {}", &stream.key, &id);
                             }
                             Err(e)=> {
-                                error!("[!][{}]: {}", &stream.key, e);
-                                anyhow::bail!("[!][{}]: {}", &stream.key, e)
+                                warn!("[!][{}]: {}", &stream.key, e);
                             }
                         }
                     }
@@ -190,33 +228,11 @@ impl StreamBus for RedisClient {
                             }
                         }
                         None => {
-                            error!("[!][{}]: Stream ID is not set for the acknowledgment: {:?}", &stream.key, stream);
-                            anyhow::bail!("[!][{}]: Stream ID is not set for the acknowledgment: {:?}", &stream.key, stream)
+                            warn!("[!][{}]: Stream ID is not set for the acknowledgment: {:?}", &stream.key, stream);
                         }
                     }
                 },
             }
         }
     }
-}
-
-async fn register_running<'a>(
-    group_name: &str,
-    keys: &[&'a str],
-    con_read: &mut MultiplexedConnection,
-) -> Vec<&'a str> {
-    let mut ids = vec![];
-    for k in keys {
-        let created: RedisResult<()> = con_read.xgroup_create_mkstream(k, group_name, "$").await;
-
-        match created {
-            Ok(_) => trace!("Group created successfully: {}", group_name),
-            Err(err) => warn!(
-                "An error occurred when creating a group {:?}: {:?}",
-                group_name, err
-            ),
-        }
-        ids.push(">");
-    }
-    ids
 }
