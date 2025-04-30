@@ -222,7 +222,7 @@ mod tests {
             client.run(&[&key], &mut read_tx).await.unwrap();
         });
         // Add a small delay to ensure the client is ready
-        // tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let sent = TestData::new("hello world");
         let start = SystemTime::now();
