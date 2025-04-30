@@ -6,6 +6,7 @@ use redis::RedisError;
 pub enum RedisBusError {
     Redis(RedisError),
     InvalidData(String),
+    Timeout(String),
 }
 
 impl From<FromUtf8Error> for RedisBusError {

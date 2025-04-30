@@ -26,6 +26,7 @@ use std::{println as trace, println as info, println as warn, println as error};
 /// - `consumer_name`: the name of consumer node
 /// - `timeout`: how much block(wait) per event request (ms)
 /// - `count`: maximum events per request
+/// - `start_id`: ID to use when creating consumer groups ("0" for all messages, "$" for new messages only)
 ///
 pub struct RedisClient {
     client: redis::Client,
@@ -33,6 +34,7 @@ pub struct RedisClient {
     consumer_name: String,
     timeout: usize,
     count: usize,
+    start_id: String,
     add_ch: (Sender<Stream>, Receiver<Stream>),
     ack_ch: (Sender<Stream>, Receiver<Stream>),
 }
@@ -46,6 +48,7 @@ impl RedisClient {
             consumer_name: consumer_name.to_owned(),
             timeout: 5_000,
             count: 5,
+            start_id: "0".to_string(), // Default to "0" to process all messages
             add_ch: channel(100),
             ack_ch: channel(100),
         })
@@ -61,6 +64,18 @@ impl RedisClient {
         self
     }
 
+    /// Set the starting ID for consumer groups
+    ///
+    /// # Arguments
+    /// * `start_id` - The ID to use when creating consumer groups:
+    ///   - "0": Process all messages in the stream (default)
+    ///   - "$": Process only new messages that arrive after group creation
+    ///   - Any valid ID: Start processing from that specific ID
+    pub fn with_start_id(mut self, start_id: &str) -> Self {
+        self.start_id = start_id.to_string();
+        self
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::new(
             &config.connection_string,
@@ -73,11 +88,13 @@ impl RedisClient {
         group_name: &str,
         keys: &[&'a str],
         con_read: &mut MultiplexedConnection,
+        start_id: &str,
     ) -> Vec<&'a str> {
         let mut ids = vec![];
         for key in keys {
-            let created: RedisResult<()> =
-                con_read.xgroup_create_mkstream(*key, group_name, "$").await;
+            let created: RedisResult<()> = con_read
+                .xgroup_create_mkstream(*key, group_name, start_id)
+                .await;
 
             match created {
                 Ok(_) => trace!("Group created successfully: {}", group_name),
@@ -160,7 +177,7 @@ impl StreamBus for RedisClient {
             .block(self.timeout)
             .count(self.count);
 
-        let ids = Self::create_groups(&self.group_name, keys, &mut con_read).await;
+        let ids = Self::create_groups(&self.group_name, keys, &mut con_read, &self.start_id).await;
 
         info!("Started listening on events. on keys: {:?}", keys);
 
@@ -234,5 +251,142 @@ impl StreamBus for RedisClient {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use super::*;
+
+    /// Resets the Redis database by flushing all data
+    ///
+    /// This is useful for ensuring test isolation.
+    /// Call this at the beginning of each test that interacts with Redis.
+    ///
+    /// # Example
+    /// ```
+    /// #[tokio::test]
+    /// async fn my_test() {
+    ///     client::test_utils::reset_redis("redis://localhost:6379").await.unwrap();
+    ///     // Test code...
+    /// }
+    /// ```
+    pub async fn reset_redis(connection_string: &str) -> Result<()> {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            let client = redis::Client::open(connection_string)?;
+            let mut con = client.get_multiplexed_async_connection().await?;
+
+            // FLUSHALL removes all keys from all databases
+            // redis::cmd("FLUSHALL").query_async::<()>(&mut con).await?;
+
+            // Delete all consumer groups for extra cleanup
+            let keys: Vec<String> = redis::cmd("KEYS").arg("*").query_async(&mut con).await?;
+
+            for key in keys {
+                // Check if the key is a stream
+                let key_type: String = redis::cmd("TYPE").arg(&key).query_async(&mut con).await?;
+
+                if key_type == "stream" {
+                    // Try to get all consumer groups for this stream
+                    let groups_result: RedisResult<Vec<redis::Value>> = redis::cmd("XINFO")
+                        .arg("GROUPS")
+                        .arg(&key)
+                        .query_async(&mut con)
+                        .await;
+
+                    if let Ok(groups) = groups_result {
+                        for group in groups {
+                            if let redis::Value::Array(group_info) = group {
+                                if group_info.len() > 1 {
+                                    if let redis::Value::BulkString(name_bytes) = &group_info[1] {
+                                        if let Ok(group_name) =
+                                            String::from_utf8(name_bytes.clone())
+                                        {
+                                            println!(
+                                                "Destroying group {} on stream {}",
+                                                group_name, &key
+                                            );
+                                            let _: RedisResult<()> = redis::cmd("XGROUP")
+                                                .arg("DESTROY")
+                                                .arg(&key)
+                                                .arg(&group_name)
+                                                .query_async(&mut con)
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now flush all keys
+            println!("Flushing all Redis keys");
+            redis::cmd("FLUSHALL").query_async::<()>(&mut con).await?;
+
+            // Verify that all keys are gone
+            let remaining_keys: Vec<String> =
+                redis::cmd("KEYS").arg("*").query_async(&mut con).await?;
+            if !remaining_keys.is_empty() {
+                println!(
+                    "Warning: Some keys remain after FLUSHALL: {:?}",
+                    remaining_keys
+                );
+            } else {
+                println!("Redis successfully reset - no keys remain");
+            }
+
+            Ok(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RedisBusError::Timeout(
+                "Redis reset operation timed out".into(),
+            )),
+        }
+    }
+    /// Creates a test client with default settings
+    pub fn create_test_client(
+        connection_string: &str,
+        group_name: &str,
+        consumer_name: &str,
+    ) -> Result<RedisClient> {
+        RedisClient::new(connection_string, group_name, consumer_name)
+            .map(|client| client.with_timeout(1000).with_count(1))
+    }
+
+    /// Waits for Redis to be available
+    ///
+    /// Useful in CI environments where Redis might take time to start
+    pub async fn wait_for_redis(connection_string: &str, max_attempts: usize) -> Result<()> {
+        let client = redis::Client::open(connection_string)?;
+
+        for attempt in 1..=max_attempts {
+            match client.get_multiplexed_async_connection().await {
+                Ok(mut con) => {
+                    // Try a simple PING command to verify connection is working
+                    match redis::cmd("PING").query_async::<String>(&mut con).await {
+                        Ok(_) => return Ok(()),
+                        Err(e) => {
+                            if attempt == max_attempts {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == max_attempts {
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            // Wait before retrying
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        Ok(())
     }
 }
