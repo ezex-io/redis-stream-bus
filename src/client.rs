@@ -1,21 +1,14 @@
 use super::config::Config;
-use super::{bus::StreamBus, stream::Stream};
+use super::{bus::StreamBus, entry::Entry};
 use crate::error::{RedisBusError, Result};
 use async_trait::async_trait;
-use futures::FutureExt;
-use futures::channel::mpsc::{Receiver, Sender, channel};
-use futures::{SinkExt, select};
-use futures_util::StreamExt;
-#[cfg(not(test))]
-use log::{error, info, trace, warn};
+use futures::SinkExt;
+use futures::channel::mpsc::Sender;
+use log::{error, trace, warn};
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, RedisResult};
 use std::collections::{BTreeMap, HashMap};
-use std::pin::Pin;
-
-#[cfg(test)]
-use std::{println as trace, println as info, println as warn, println as error};
 
 /// **RedisClient** will keep connection and internal options of redis client
 ///
@@ -29,14 +22,12 @@ use std::{println as trace, println as info, println as warn, println as error};
 /// - `start_id`: ID to use when creating consumer groups ("0" for all messages, "$" for new messages only)
 ///
 pub struct RedisClient {
-    client: redis::Client,
+    pub(crate) client: redis::Client,
     group_name: String,
     consumer_name: String,
     timeout: usize,
     count: usize,
     start_id: String,
-    add_ch: (Sender<Stream>, Receiver<Stream>),
-    ack_ch: (Sender<Stream>, Receiver<Stream>),
 }
 
 impl RedisClient {
@@ -49,8 +40,6 @@ impl RedisClient {
             timeout: 5_000,
             count: 5,
             start_id: "0".to_string(), // Default to "0" to process all messages
-            add_ch: channel(100),
-            ack_ch: channel(100),
         })
     }
 
@@ -82,30 +71,6 @@ impl RedisClient {
             &config.group_name,
             &config.consumer_name,
         )
-    }
-
-    async fn create_groups<'a>(
-        group_name: &str,
-        keys: &[&'a str],
-        con_read: &mut MultiplexedConnection,
-        start_id: &str,
-    ) -> Vec<&'a str> {
-        let mut ids = vec![];
-        for key in keys {
-            let created: RedisResult<()> = con_read
-                .xgroup_create_mkstream(*key, group_name, start_id)
-                .await;
-
-            match created {
-                Ok(_) => trace!("Group created successfully: {}", group_name),
-                Err(err) => warn!(
-                    "An error occurred when creating a group {:?}: {:?}",
-                    group_name, err
-                ),
-            }
-            ids.push(">");
-        }
-        ids
     }
 
     pub(super) fn map_to_value(map: HashMap<String, redis::Value>) -> redis::Value {
@@ -152,241 +117,169 @@ impl RedisClient {
             )),
         }
     }
+
+    pub fn get_sync_connection(&self) -> Result<redis::Connection> {
+        Ok(self.client.get_connection()?)
+    }
+
+    pub async fn get_async_connection(&self) -> Result<redis::aio::MultiplexedConnection> {
+        Ok(self.client.get_multiplexed_tokio_connection().await?)
+    }
+
+    pub fn get_read_options(&self) -> StreamReadOptions {
+        StreamReadOptions::default()
+            .group(&self.group_name, &self.consumer_name)
+            .block(self.timeout)
+            .count(self.count)
+    }
+
+    pub async fn create_groups(&self, keys: &[&str]) {
+        let mut conn = self.get_async_connection().await.unwrap();
+        for key in keys {
+            let created: RedisResult<()> = conn
+                .xgroup_create_mkstream(*key, self.group_name.clone(), self.start_id.clone())
+                .await;
+
+            match created {
+                Ok(_) => trace!("Group created successfully: {}", self.group_name),
+                Err(err) => warn!(
+                    "An error occurred when creating a group {:?}: {:?}",
+                    self.group_name, err
+                ),
+            }
+        }
+    }
+
+    /// Appends a new stream entry to a Redis stream using the `XADD` command.
+    ///
+    /// # Arguments
+    /// * `entry` - The entry object containing the key, optional ID, and field-value pairs to append.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The ID assigned to the newly added entry.
+    /// * `Err` - If the operation fails (e.g., due to a Redis error or invalid input).
+    ///
+    /// # Notes
+    /// * If Entry `id is `None`, Redis will auto-generate an ID (using "*").
+    ///
+    /// [Redis XADD command documentation](https://redis.io/docs/latest/commands/xadd/)
+    pub async fn xadd(&mut self, entry: Entry) -> Result<String> {
+        let mut conn = self.get_async_connection().await?;
+
+        let entry_id = match entry.id {
+            Some(id) => id,
+            None => "*".to_owned(),
+        };
+
+        let map = Self::value_to_map(entry.fields)?;
+
+        let id = conn
+            .xadd_map::<_, _, BTreeMap<String, Vec<u8>>, String>(
+                entry.key.clone(),
+                entry_id,
+                map.clone(),
+            )
+            .await?;
+
+        Ok(id)
+    }
+
+    /// Acknowledges a processed stream entry within a Redis consumer group using `XACK`.
+    ///
+    /// # Arguments
+    /// * `entry` - The stream entry object containing the key and the entry ID to acknowledge.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The acknowledged entry's ID if the acknowledgment succeeded.
+    /// * `Err` - If the ID is missing or Redis did not acknowledge the entry.
+    ///
+    /// # Notes
+    /// * Uses the `XACK` command to mark the message as processed.
+    /// * The acknowledgment is scoped to this client's `group_name`.
+    ///
+    /// [Redis XACK command documentation](https://redis.io/docs/latest/commands/xack/)
+    pub async fn xack(&mut self, entry: &Entry) -> Result<String> {
+        match &entry.id {
+            Some(id) => {
+                let mut conn = self.get_async_connection().await?;
+
+                let no = conn
+                    .xack::<_, _, _, i32>(&entry.key, &self.group_name, &[&entry.id])
+                    .await?;
+
+                if no == 1 {
+                    Ok(id.clone())
+                } else {
+                    Err(RedisBusError::InvalidData(format!(
+                        "Failed to acknowledge entry with ID: {}",
+                        id
+                    )))
+                }
+            }
+            None => Err(RedisBusError::InvalidData(format!(
+                "Entry ID is not set for the acknowledgment: {}",
+                entry.key
+            ))),
+        }
+    }
+
+    pub async fn xread_one(&mut self, key: &str) -> Result<Entry> {
+        let mut conn = self.get_async_connection().await?;
+        let read_reply: StreamReadReply = conn
+            .xread_options(&[key], &[">"], &self.get_read_options())
+            .await?;
+
+        let stream_key = read_reply.keys.first().unwrap();
+        let steam_id = stream_key.ids.first().unwrap();
+        let fields = Self::map_to_value(steam_id.clone().map);
+
+        Ok(Entry::new(&stream_key.key, fields).with_id(steam_id.clone().id))
+    }
+
+    pub async fn read_loop(
+        mut conn: MultiplexedConnection,
+        opts: StreamReadOptions,
+        keys: &[&str],
+        read_tx: &mut Sender<Entry>,
+    ) -> Result<()> {
+        // Set the stream ID to ">", and it means: messages never delivered to other consumers so far.
+        let ids = [">"];
+        loop {
+            let read_option: std::result::Result<StreamReadReply, redis::RedisError> =
+                conn.xread_options(keys, &ids, &opts).await;
+
+            match read_option {
+                Ok(stream) => {
+                    for stream_key in stream.keys {
+                        for entry in stream_key.ids {
+                            trace!("[>][{}]: {}", &stream_key.key, entry.id);
+
+                            let fields = Self::map_to_value(entry.map);
+                            let entry = Entry::new(&stream_key.key, fields).with_id(entry.id);
+                            if let Err(err) = read_tx.send(entry).await {
+                                error!("[!]: {:?}", err);
+                                break;
+                            };
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!("[!]: {:?} , CODE:'{:?}'", err, err.code());
+
+                    return Err(RedisBusError::Redis(err));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl StreamBus for RedisClient {
-    fn xadd_sender(&self) -> Sender<Stream> {
-        self.add_ch.0.clone()
-    }
-    fn xack_sender(&self) -> Sender<Stream> {
-        self.ack_ch.0.clone()
+    async fn xadd(&mut self, entry: Entry) -> Result<String> {
+        self.xadd(entry).await
     }
 
-    async fn run<'a, 'b>(
-        &mut self,
-        keys: &[&'a str],
-        read_tx: &'b mut Sender<Stream>,
-    ) -> Result<()> {
-        let mut con_read = self.client.get_multiplexed_async_connection().await?;
-        let mut con_add = self.client.get_multiplexed_async_connection().await?;
-        let mut con_ack = self.client.get_multiplexed_async_connection().await?;
-
-        let opts = StreamReadOptions::default()
-            .group(&self.group_name, &self.consumer_name)
-            .block(self.timeout)
-            .count(self.count);
-
-        let ids = Self::create_groups(&self.group_name, keys, &mut con_read, &self.start_id).await;
-
-        info!("Started listening on events. on keys: {:?}", keys);
-
-        loop {
-            let mut read_stream: futures_util::future::IntoStream<
-                Pin<
-                    Box<
-                        dyn futures_util::Future<
-                                Output = std::result::Result<StreamReadReply, redis::RedisError>,
-                            > + std::marker::Send,
-                    >,
-                >,
-            > = con_read.xread_options(keys, &ids, &opts).into_stream();
-
-            select! {
-                read_option = read_stream.next() => if let Some(stream_result) = read_option {
-                    match stream_result {
-                        Ok(stream) =>{
-                            for stream_key in stream.keys {
-                                for stream_id in stream_key.ids {
-                                    trace!("[>][{}]: {}", &stream_key.key, stream_id.id);
-
-                                    let fields = Self::map_to_value(stream_id.map);
-                                    let stream = Stream::new(&stream_key.key, Some(stream_id.id), fields);
-                                    if let Err(err) = read_tx.send(stream).await {
-                                        error!("[!]: {:?}", err);
-                                        break;
-                                    };
-                                }
-                            }
-                        },
-                        Err (err) => {
-                            warn!("[!]: {:?} , CODE:'{:?}'", err,err.code());
-                        }
-                    }
-                },
-                add_option = self.add_ch.1.next() => {
-                    if let Some(stream) = add_option {
-                        let stream_id = match stream.id {
-                            Some(id) => id,
-                            None => "*".to_owned(),
-                        };
-
-                       let map = Self::value_to_map(stream.fields)?;
-                       match con_add.xadd_map::<_, _, BTreeMap<String, Vec<u8>>, String>(
-                            stream.key.clone(),
-                            stream_id,
-                            map,
-                        ).await {
-                            Ok(id) => {
-                                trace!("[<][{}]: {}", &stream.key, &id);
-                            }
-                            Err(e)=> {
-                                warn!("[!][{}]: {}", &stream.key, e);
-                            }
-                        }
-                    }
-                },
-                ack_option = self.ack_ch.1.next() => if let Some(stream) = ack_option {
-                    match stream.id {
-                        Some(id) => {
-                            trace!("[^][{}]: {}", &stream.key, &id);
-                            if let Err(err) = con_ack.xack::<_, _, _, i32>(&stream.key, &self.group_name, &[id]).await{
-                                error!("[!][{}]: {}", &stream.key, err);
-                            }
-                        }
-                        None => {
-                            warn!("[!][{}]: Stream ID is not set for the acknowledgment: {:?}", &stream.key, stream);
-                        }
-                    }
-                },
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_utils {
-    use super::*;
-
-    /// Resets the Redis database by flushing all data
-    ///
-    /// This is useful for ensuring test isolation.
-    /// Call this at the beginning of each test that interacts with Redis.
-    ///
-    /// # Example
-    /// ```
-    /// #[tokio::test]
-    /// async fn my_test() {
-    ///     client::test_utils::reset_redis("redis://localhost:6379").await.unwrap();
-    ///     // Test code...
-    /// }
-    /// ```
-    pub async fn reset_redis(connection_string: &str) -> Result<()> {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-            let client = redis::Client::open(connection_string)?;
-            let mut con = client.get_multiplexed_async_connection().await?;
-
-            // FLUSHALL removes all keys from all databases
-            // redis::cmd("FLUSHALL").query_async::<()>(&mut con).await?;
-
-            // Delete all consumer groups for extra cleanup
-            let keys: Vec<String> = redis::cmd("KEYS").arg("*").query_async(&mut con).await?;
-
-            for key in keys {
-                // Check if the key is a stream
-                let key_type: String = redis::cmd("TYPE").arg(&key).query_async(&mut con).await?;
-
-                if key_type == "stream" {
-                    // Try to get all consumer groups for this stream
-                    let groups_result: RedisResult<Vec<redis::Value>> = redis::cmd("XINFO")
-                        .arg("GROUPS")
-                        .arg(&key)
-                        .query_async(&mut con)
-                        .await;
-
-                    if let Ok(groups) = groups_result {
-                        for group in groups {
-                            if let redis::Value::Array(group_info) = group {
-                                if group_info.len() > 1 {
-                                    if let redis::Value::BulkString(name_bytes) = &group_info[1] {
-                                        if let Ok(group_name) =
-                                            String::from_utf8(name_bytes.clone())
-                                        {
-                                            println!(
-                                                "Destroying group {} on stream {}",
-                                                group_name, &key
-                                            );
-                                            let _: RedisResult<()> = redis::cmd("XGROUP")
-                                                .arg("DESTROY")
-                                                .arg(&key)
-                                                .arg(&group_name)
-                                                .query_async(&mut con)
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Now flush all keys
-            println!("Flushing all Redis keys");
-            redis::cmd("FLUSHALL").query_async::<()>(&mut con).await?;
-
-            // Verify that all keys are gone
-            let remaining_keys: Vec<String> =
-                redis::cmd("KEYS").arg("*").query_async(&mut con).await?;
-            if !remaining_keys.is_empty() {
-                println!(
-                    "Warning: Some keys remain after FLUSHALL: {:?}",
-                    remaining_keys
-                );
-            } else {
-                println!("Redis successfully reset - no keys remain");
-            }
-
-            Ok(())
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(RedisBusError::Timeout(
-                "Redis reset operation timed out".into(),
-            )),
-        }
-    }
-    /// Creates a test client with default settings
-    pub fn create_test_client(
-        connection_string: &str,
-        group_name: &str,
-        consumer_name: &str,
-    ) -> Result<RedisClient> {
-        RedisClient::new(connection_string, group_name, consumer_name)
-            .map(|client| client.with_timeout(1000).with_count(1))
-    }
-
-    /// Waits for Redis to be available
-    ///
-    /// Useful in CI environments where Redis might take time to start
-    pub async fn wait_for_redis(connection_string: &str, max_attempts: usize) -> Result<()> {
-        let client = redis::Client::open(connection_string)?;
-
-        for attempt in 1..=max_attempts {
-            match client.get_multiplexed_async_connection().await {
-                Ok(mut con) => {
-                    // Try a simple PING command to verify connection is working
-                    match redis::cmd("PING").query_async::<String>(&mut con).await {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            if attempt == max_attempts {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if attempt == max_attempts {
-                        return Err(e.into());
-                    }
-                }
-            }
-
-            // Wait before retrying
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-
-        Ok(())
+    async fn xack(&mut self, entry: &Entry) -> Result<String> {
+        self.xack(entry).await
     }
 }

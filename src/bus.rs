@@ -1,15 +1,9 @@
+use crate::entry::Entry;
 use crate::error::Result;
-use crate::stream::Stream;
 use async_trait::async_trait;
-use futures::channel::mpsc::Sender;
 
 #[async_trait]
 pub trait StreamBus {
-    fn xadd_sender(&self) -> Sender<Stream>;
-    fn xack_sender(&self) -> Sender<Stream>;
-    async fn run<'a, 'b>(
-        &mut self,
-        keys: &[&'a str],
-        read_tx: &'b mut Sender<Stream>,
-    ) -> Result<()>;
+    async fn xadd(&mut self, entry: Entry) -> Result<String>;
+    async fn xack(&mut self, entry: &Entry) -> Result<String>;
 }

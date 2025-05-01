@@ -1,5 +1,0 @@
-[profile.default]
-fail-fast = false # run all tests, even if some failed
-#slow-timeout = { period = "3s", terminate-after = 7 }
-status-level = "skip"
-
