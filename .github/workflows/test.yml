@@ -1,9 +1,10 @@
 name: Testing (Rust)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: stable
-permissions:
-  contents: read
 
 on:
   push:
@@ -14,61 +15,14 @@ on:
 jobs:
   testing:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          [
-            {
-              rust: stable,
-              db-org: redis,
-              db-name: redis,
-              db-version: 7.2.4
-            },
-            {
-              rust: stable,
-              db-org: redis,
-              db-name: redis,
-              db-version: 8.0-rc1
-            },
-          ]
+
     services:
       redis:
-        image: redis:${{ matrix.config.db-version }}
+        image: redis:8.0-rc1
         ports:
           - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+
     steps:
-      # - name: Cache Redis
-      #   id: cache-redis
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: |
-      #       ~/redis-cli
-      #       ~/redis-server
-      #     key: ${{ runner.os }}-${{ matrix.config.db-name }}-${{ matrix.config.db-version }}
-
-      # - name: Install Redis
-      #   if: steps.cache-redis.outputs.cache-hit != 'true'
-      #   run: |
-      #     sudo apt-get update
-      #     wget https://github.com/${{ matrix.config.db-org }}/${{ matrix.config.db-name }}/archive/${{ matrix.config.db-version }}.tar.gz;
-      #     tar -xzvf ${{ matrix.config.db-version }}.tar.gz;
-      #     pushd ${{ matrix.config.db-name }}-${{ matrix.config.db-version }} && 
-      #     BUILD_TLS=yes make install && 
-      #     sudo mv src/${{ matrix.config.db-name }}-server $HOME/redis-server &&
-      #     sudo mv src/${{ matrix.config.db-name }}-cli $HOME/redis-cli && 
-      #     popd;
-      #     echo $PATH
-
-      # - name: Set PATH
-      #   run: echo "$HOME" >> $GITHUB_PATH
-        
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,10 +30,6 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          env-vars: "RUST_TOOLCHAIN=${{env.RUST_TOOLCHAIN}}"
 
       - name: Run Tests
         run: cargo test

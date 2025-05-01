@@ -18,4 +18,4 @@ simple_logger = "5.0"
 mockall = "0.13"
 serde_redis = { version = "0.3", git = "https://github.com/ezex-io/serde-redis" }
 tokio = { version = "1.43", features = ["macros"] }
-# redis-test = { version = "0.10", features = ["aio"] }
+serial_test = "3.2"
