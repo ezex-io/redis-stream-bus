@@ -1,9 +1,10 @@
 name: Lint and Format Check (Rust)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: stable
-permissions:
-  contents: read
 
 on:
   push:
@@ -21,11 +22,6 @@ jobs:
         with:
           toolchain: ${{env.RUST_TOOLCHAIN}}
           components: clippy, rustfmt
-
-      - name: installing dependencies
-        run: |
-          cargo version
-          sudo apt install -y protobuf-compiler
 
       - name: Checkout code
         uses: actions/checkout@v4

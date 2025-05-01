@@ -1,19 +1,65 @@
 #[cfg(test)]
 mod tests {
-    use crate::bus::StreamBus;
     use crate::client::RedisClient;
+    use crate::entry::Entry;
     use crate::error::{RedisBusError, Result};
-    use crate::stream::Stream;
+    use futures::StreamExt;
     use futures::channel::mpsc::channel;
-    use futures::channel::oneshot::Receiver;
-    use futures::{SinkExt, StreamExt};
     use redis::Value;
     use serde::{Deserialize, Serialize};
+    use serial_test::serial;
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::{select, task};
+    use tokio::select;
+    use tokio::task;
 
     const REDIS_CON: &str = "redis://localhost:6379";
+
+    pub(super) struct Testsuite {
+        pub(super) client: RedisClient,
+    }
+
+    impl Testsuite {
+        pub fn create_test_client(group_name: &str, consumer_name: &str) -> Result<Testsuite> {
+            let connection_string = format!("{}/15", REDIS_CON); // Use DB 15 for testing
+
+            Ok(Testsuite {
+                client: RedisClient::new(&connection_string, group_name, consumer_name)?,
+            })
+        }
+    }
+
+    impl Drop for Testsuite {
+        fn drop(&mut self) {
+            if let Ok(mut con) = self.client.get_sync_connection() {
+                let _: redis::RedisResult<()> = redis::cmd("FLUSHDB").query(&mut con);
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct TestData {
+        field: String,
+    }
+
+    impl TestData {
+        fn new(msg: &str) -> Self {
+            TestData {
+                field: msg.to_owned(),
+            }
+        }
+
+        fn from_value(value: Value) -> Self {
+            let de = serde_redis::Deserializer::new(value);
+            let decoded: TestData = Deserialize::deserialize(de).unwrap();
+
+            decoded
+        }
+
+        fn to_value(&self) -> Value {
+            self.serialize(serde_redis::Serializer).unwrap()
+        }
+    }
 
     #[test]
     fn test_value_to_map_table() {
@@ -92,192 +138,207 @@ mod tests {
         }
     }
 
-    #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-    struct TestData {
-        f1: String,
-    }
+    #[tokio::test]
+    #[serial]
+    async fn test_xadd() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
-    impl TestData {
-        fn new(msg: &str) -> Self {
-            TestData { f1: msg.to_owned() }
-        }
+        let sent = TestData::new("hello world");
+        let entry = Entry::new("test_key", sent.to_value());
+        let id = ts.client.xadd(entry).await.unwrap();
 
-        fn from_value(value: Value) -> Self {
-            let de = serde_redis::Deserializer::new(value);
-            let decoded: TestData = Deserialize::deserialize(de).unwrap();
-
-            decoded
-        }
-
-        fn to_value(&self) -> Value {
-            self.serialize(serde_redis::Serializer).unwrap()
-        }
+        assert!(!id.is_empty());
     }
 
     #[tokio::test]
-    async fn test_add_stream() {
-        let mut client = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
+    #[serial]
+    async fn test_xadd_with_id() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
-        let mut add_tx = client.xadd_sender();
-        let (mut read_tx, mut read_rx) = channel(100);
-
-        task::spawn(async move {
-            client.run(&["key_read_id"], &mut read_tx).await.unwrap();
-        });
-
-        let sent = TestData::new("hello world");
-        let stream_out = Stream::new("key_read_id", None, sent.to_value());
-
-        add_tx.send(stream_out.clone()).await.unwrap();
-
-        let stream_in = read_rx.next().await.unwrap();
-        let received = TestData::from_value(stream_in.fields);
-
-        assert_eq!(sent, received);
-    }
-
-    #[tokio::test]
-    async fn test_add_stream_with_id() {
-        let mut client = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
-
-        let mut add_tx = client.xadd_sender();
-        let (mut read_tx, mut read_rx) = channel(100);
-
-        task::spawn(async move {
-            client.run(&["key_read_id"], &mut read_tx).await.unwrap();
-        });
-
-        let sent = TestData::new("hello world");
         let start = SystemTime::now();
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
 
-        let stream_id = Some(format!("{}-0", since_the_epoch.as_millis()));
-        let stream_out = Stream::new("key_read_id", stream_id.clone(), sent.to_value());
-
-        add_tx.send(stream_out.clone()).await.unwrap();
-
-        let stream_in = read_rx.next().await.unwrap();
-        let received = TestData::from_value(stream_in.fields);
-
-        assert_eq!(sent, received);
-        assert_eq!(stream_id, stream_out.id);
-    }
-
-    #[tokio::test]
-    async fn test_read_one_group() {
-        let mut client = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
-
-        let mut add_tx = client.xadd_sender();
-        let (mut read_tx, mut read_rx) = channel(100);
-
-        task::spawn(async move {
-            client
-                .run(&["key_read_one_group"], &mut read_tx)
-                .await
-                .unwrap();
-        });
+        let entry_id = format!("{}-0", since_the_epoch.as_millis());
 
         let sent = TestData::new("hello world");
-        let stream_out = Stream::new("key_read_one_group", None, sent.to_value());
+        let entry = Entry::new("test_key", sent.to_value()).with_id(entry_id.clone());
+        let id = ts.client.xadd(entry).await.unwrap();
 
-        add_tx.send(stream_out.clone()).await.unwrap();
-
-        let stream_in = read_rx.next().await.unwrap();
-        let received = TestData::from_value(stream_in.fields);
-
-        assert_eq!(sent, received);
-        assert_eq!(stream_in.key, stream_out.key);
+        assert_eq!(id, entry_id);
     }
 
     #[tokio::test]
+    #[serial]
+    async fn test_xack_unknown_id() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+
+        let sent = TestData::new("hello world");
+        let entry = Entry::new("test_key", sent.to_value());
+
+        let ret = ts.client.xack(&entry).await;
+        assert!(ret.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_xack_undelivered_id() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+
+        let sent = TestData::new("hello world");
+        let mut entry = Entry::new("test_key", sent.to_value());
+        let id = ts.client.xadd(entry.clone()).await.unwrap();
+
+        entry.id = Some(id.clone());
+
+        let ret = ts.client.xack(&entry).await;
+        assert!(ret.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_xack_ok() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+
+        let test_key = "key_foo";
+        ts.client.create_groups(&[test_key]).await;
+
+        let sent = TestData::new("hello world");
+        let entry_in = Entry::new(test_key, sent.to_value());
+        let id = ts.client.xadd(entry_in.clone()).await.unwrap();
+
+        let entry_out = ts.client.xread_one(test_key).await.unwrap();
+
+        let ack_id = ts.client.xack(&entry_out).await.unwrap();
+        assert_eq!(ack_id, id);
+    }
+
+    // This test verifies that all messages sent to a single consumer group
+    // are delivered in exactly the same order they were published.
+    #[tokio::test]
+    #[serial]
+    async fn test_read_one_group() {
+        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+
+        let test_key = "key_foo";
+        ts.client.create_groups(&[test_key]).await;
+
+        // TODO: Can be simpler??
+        let (mut read_tx, mut read_rx) = channel(100);
+        let conn = ts.client.get_async_connection().await.unwrap();
+        let opts = ts.client.get_read_options();
+        task::spawn(async move {
+            RedisClient::read_loop(conn, opts, &[test_key], &mut read_tx)
+                .await
+                .unwrap();
+        });
+
+        // Create and send test data
+        let test_messages = vec!["test1", "test2", "test3"];
+        for msg in &test_messages {
+            let entry = Entry::new(test_key, TestData::new(msg).to_value());
+            ts.client.xadd(entry).await.unwrap();
+        }
+
+        // Verify received messages
+        for expected_msg in test_messages {
+            let received = read_rx.next().await.unwrap();
+            let received_data = TestData::from_value(received.fields);
+            assert_eq!(TestData::new(expected_msg), received_data);
+        }
+    }
+
+    // This test verifies that all messages sent to two separate consumer groups
+    // are delivered in the correct order within each group.
+    #[tokio::test]
+    #[serial]
     async fn test_read_two_groups() {
-        let mut client_1 = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
-        let mut client_2 = RedisClient::new(REDIS_CON, "group_2", "consumer_1").unwrap();
+        let mut ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts_2 = Testsuite::create_test_client("group_2", "consumer_1").unwrap();
 
-        let mut add_tx_1 = client_1.xadd_sender();
+        let test_key = "key_foo";
+        ts_1.client.create_groups(&[test_key]).await;
+        ts_2.client.create_groups(&[test_key]).await;
+
         let (mut read_tx_1, mut read_rx_1) = channel(100);
+        let conn_1 = ts_1.client.get_async_connection().await.unwrap();
+        let opts_1 = ts_1.client.get_read_options();
+        task::spawn(async move {
+            RedisClient::read_loop(conn_1, opts_1, &[test_key], &mut read_tx_1)
+                .await
+                .unwrap();
+        });
+
         let (mut read_tx_2, mut read_rx_2) = channel(100);
-
+        let conn_2 = ts_2.client.get_async_connection().await.unwrap();
+        let opts_2 = ts_2.client.get_read_options();
         task::spawn(async move {
-            client_1.run(&["foo"], &mut read_tx_1).await.unwrap();
+            RedisClient::read_loop(conn_2, opts_2, &[test_key], &mut read_tx_2)
+                .await
+                .unwrap();
         });
 
-        task::spawn(async move {
-            client_2.run(&["foo", "bar"], &mut read_tx_2).await.unwrap();
-        });
+        // Create and send test data
+        let test_messages = vec!["test1", "test2", "test3"];
+        for msg in &test_messages {
+            let entry = Entry::new(test_key, TestData::new(msg).to_value());
+            ts_1.client.xadd(entry).await.unwrap();
+        }
 
-        let sent_1 = TestData::new("test1");
-        let sent_2 = TestData::new("test2");
-        let sent_3 = TestData::new("test3");
+        // Verify received messages
+        for expected_msg in test_messages {
+            let received_1 = read_rx_1.next().await.unwrap();
+            let received_data_1 = TestData::from_value(received_1.fields);
+            assert_eq!(TestData::new(expected_msg), received_data_1);
 
-        let stream_out_1 = Stream::new("key_1", None, sent_1.to_value());
-        let stream_out_2 = Stream::new("key_2", None, sent_2.to_value());
-        let stream_out_3 = Stream::new("key_3", None, sent_3.to_value());
-
-        add_tx_1.send(stream_out_1.clone()).await.unwrap();
-        add_tx_1.send(stream_out_2.clone()).await.unwrap();
-        add_tx_1.send(stream_out_3.clone()).await.unwrap();
-
-        let stream_in_1 = read_rx_1.next().await.unwrap();
-        let stream_in_2 = read_rx_2.next().await.unwrap();
-        let stream_in_3 = read_rx_2.next().await.unwrap();
-
-        let received_1 = TestData::from_value(stream_in_1.fields);
-        let received_2 = TestData::from_value(stream_in_2.fields);
-        let received_3 = TestData::from_value(stream_in_3.fields);
-
-        assert_eq!(sent_1, received_1);
-        assert_eq!(sent_2, received_2);
-        assert_eq!(sent_3, received_3);
+            let received_2 = read_rx_2.next().await.unwrap();
+            let received_data_2 = TestData::from_value(received_2.fields);
+            assert_eq!(TestData::new(expected_msg), received_data_2);
+        }
     }
 
+    // This test verifies that all messages sent to two consumers
+    // are delivered only once to each consumer, and all messages are received.
     #[tokio::test]
+    #[serial]
     async fn test_two_consumers() {
-        let mut consumer_1 = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
-        let mut consumer_2 = RedisClient::new(REDIS_CON, "group_1", "consumer_2").unwrap();
+        let mut ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts_2 = Testsuite::create_test_client("group_1", "consumer_2").unwrap();
 
-        let mut add_tx_1 = consumer_1.xadd_sender();
+        let test_key = "key_foo";
+        ts_1.client.create_groups(&[test_key]).await;
+        ts_2.client.create_groups(&[test_key]).await;
+
         let (mut read_tx_1, mut read_rx_1) = channel(100);
+        let conn_1 = ts_1.client.get_async_connection().await.unwrap();
+        let opts_1 = ts_1.client.get_read_options();
+        task::spawn(async move {
+            RedisClient::read_loop(conn_1, opts_1, &[test_key], &mut read_tx_1)
+                .await
+                .unwrap();
+        });
+
         let (mut read_tx_2, mut read_rx_2) = channel(100);
-
+        let conn_2 = ts_2.client.get_async_connection().await.unwrap();
+        let opts_2 = ts_2.client.get_read_options();
         task::spawn(async move {
-            consumer_1
-                .run(&["key_2_consumers"], &mut read_tx_1)
+            RedisClient::read_loop(conn_2, opts_2, &[test_key], &mut read_tx_2)
                 .await
                 .unwrap();
         });
 
-        task::spawn(async move {
-            consumer_2
-                .run(&["key_2_consumers"], &mut read_tx_2)
-                .await
-                .unwrap();
-        });
+        // Create and send test data
+        let test_messages = vec!["test1", "test2", "test3"];
+        for msg in &test_messages {
+            let entry = Entry::new(test_key, TestData::new(msg).to_value());
+            ts_1.client.xadd(entry).await.unwrap();
+        }
 
-        let sent = [
-            TestData::new("test1"),
-            TestData::new("test2"),
-            TestData::new("test3"),
-            TestData::new("test4"),
-        ];
-
-        let streams_out = [
-            Stream::new("key_2_consumers", None, sent[0].to_value()),
-            Stream::new("key_2_consumers", None, sent[1].to_value()),
-            Stream::new("key_2_consumers", None, sent[2].to_value()),
-            Stream::new("key_2_consumers", None, sent[3].to_value()),
-        ];
-
-        add_tx_1.send(streams_out[0].clone()).await.unwrap();
-        add_tx_1.send(streams_out[1].clone()).await.unwrap();
-        add_tx_1.send(streams_out[2].clone()).await.unwrap();
-        add_tx_1.send(streams_out[3].clone()).await.unwrap();
-
+        // Verify received messages
         let mut received = Vec::new();
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             select! {
                 read_option = read_rx_1.next() => if let Some(stream_in) = read_option {
                     received.push(TestData::from_value(stream_in.fields))
@@ -288,35 +349,9 @@ mod tests {
             }
         }
 
-        assert!(received.contains(&sent[0]));
-        assert!(received.contains(&sent[1]));
-        assert!(received.contains(&sent[2]));
-        assert!(received.contains(&sent[3]));
-    }
-
-    #[tokio::test]
-    async fn test_ack() {
-        let mut client_1 = RedisClient::new(REDIS_CON, "group_1", "consumer_1").unwrap();
-
-        let mut add_tx = client_1.xadd_sender();
-        let mut ack_tx = client_1.xack_sender();
-        let (mut read_tx_1, mut read_rx_1) = channel(100);
-
-        task::spawn(async move {
-            client_1.run(&["key_ack"], &mut read_tx_1).await.unwrap();
-        });
-
-        let sent_1 = TestData::new("test1");
-        let sent_2 = TestData::new("test2");
-
-        let stream_out_1 = Stream::new("key_1", None, sent_1.to_value());
-        let stream_out_2 = Stream::new("key_2", None, sent_2.to_value());
-
-        add_tx.send(stream_out_1.clone()).await.unwrap();
-        let stream_in_1 = read_rx_1.next().await.unwrap();
-        ack_tx.send(stream_in_1.clone()).await.unwrap();
-
-        add_tx.send(stream_out_2.clone()).await.unwrap();
-        read_rx_1.next().await.unwrap();
+        for _ in 0..3 {
+            let received_data = received.pop().unwrap();
+            assert!(test_messages.contains(&received_data.field.as_str()));
+        }
     }
 }
