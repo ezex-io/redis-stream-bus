@@ -163,7 +163,7 @@ impl RedisClient {
     /// * If Entry `id is `None`, Redis will auto-generate an ID (using "*").
     ///
     /// [Redis XADD command documentation](https://redis.io/docs/latest/commands/xadd/)
-    pub async fn xadd(&mut self, entry: Entry) -> Result<String> {
+    pub async fn xadd(&self, entry: Entry) -> Result<String> {
         let mut conn = self.get_async_connection().await?;
 
         let entry_id = match entry.id {
@@ -198,7 +198,7 @@ impl RedisClient {
     /// * The acknowledgment is scoped to this client's `group_name`.
     ///
     /// [Redis XACK command documentation](https://redis.io/docs/latest/commands/xack/)
-    pub async fn xack(&mut self, entry: &Entry) -> Result<String> {
+    pub async fn xack(&self, entry: &Entry) -> Result<String> {
         match &entry.id {
             Some(id) => {
                 let mut conn = self.get_async_connection().await?;
@@ -223,7 +223,7 @@ impl RedisClient {
         }
     }
 
-    pub async fn xread_one(&mut self, key: &str) -> Result<Entry> {
+    pub async fn xread_one(&self, key: &str) -> Result<Entry> {
         let mut conn = self.get_async_connection().await?;
         let read_reply: StreamReadReply = conn
             .xread_options(&[key], &[">"], &self.get_read_options())

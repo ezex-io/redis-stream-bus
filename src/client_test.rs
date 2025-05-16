@@ -141,7 +141,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_xadd() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let sent = TestData::new("hello world");
         let entry = Entry::new("test_key", sent.to_value());
@@ -153,7 +153,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_xadd_with_id() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let start = SystemTime::now();
         let since_the_epoch = start
@@ -172,7 +172,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_xack_unknown_id() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let sent = TestData::new("hello world");
         let entry = Entry::new("test_key", sent.to_value());
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_xack_undelivered_id() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let sent = TestData::new("hello world");
         let mut entry = Entry::new("test_key", sent.to_value());
@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_xack_ok() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let test_key = "key_foo";
         ts.client.create_groups(&[test_key]).await;
@@ -219,7 +219,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_read_one_group() {
-        let mut ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
 
         let test_key = "key_foo";
         ts.client.create_groups(&[test_key]).await;
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_read_two_groups() {
-        let mut ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
         let ts_2 = Testsuite::create_test_client("group_2", "consumer_1").unwrap();
 
         let test_key = "key_foo";
@@ -303,7 +303,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_two_consumers() {
-        let mut ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
+        let ts_1 = Testsuite::create_test_client("group_1", "consumer_1").unwrap();
         let ts_2 = Testsuite::create_test_client("group_1", "consumer_2").unwrap();
 
         let test_key = "key_foo";

@@ -17,5 +17,5 @@ thiserror = "2.0"
 simple_logger = "5.0"
 mockall = "0.13"
 serde_redis = { version = "0.3", git = "https://github.com/ezex-io/serde-redis" }
-tokio = { version = "1.43", features = ["macros"] }
+tokio = { version = "1.45", features = ["macros"] }
 serial_test = "3.2"
