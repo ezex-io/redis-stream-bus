@@ -50,14 +50,14 @@ mod tests {
         }
 
         fn from_value(value: Value) -> Self {
-            let de = serde_redis::Deserializer::new(value);
+            let de = redis_serde::Deserializer::new(value);
             let decoded: TestData = Deserialize::deserialize(de).unwrap();
 
             decoded
         }
 
         fn to_value(&self) -> Value {
-            self.serialize(serde_redis::Serializer).unwrap()
+            self.serialize(redis_serde::Serializer).unwrap()
         }
     }
 
