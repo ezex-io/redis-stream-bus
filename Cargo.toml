@@ -2,6 +2,14 @@
 name = "redis_stream_bus"
 version = "0.1.0"
 edition = "2024"
+authors = ["ezex-io"]
+description = "Async Redis Streams client that simplifies publishing, reading, and acknowledging entries."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ezex-io/redis-stream-bus"
+documentation = "https://docs.rs/redis-stream-bus"
+keywords = ["redis", "redis-streams", "messaging", "event-bus"]
+categories = ["database", "network-programming"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
