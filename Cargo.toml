@@ -1,11 +1,11 @@
 [package]
 name = "redis_stream_bus"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
-redis = { version = "0.31", features = ["streams", "tokio-comp", "connection-manager"] }
+redis = { version = "0.32", features = ["streams", "tokio-comp", "connection-manager"] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 async-trait = "0.1"
@@ -14,8 +14,12 @@ futures-util = "0.3"
 thiserror = "2.0"
 
 [dev-dependencies]
-simple_logger = "5.0"
+simple_logger = "5.1"
 mockall = "0.13"
-serde_redis = { version = "0.3", git = "https://github.com/ezex-io/serde-redis" }
-tokio = { version = "1.45", features = ["macros"] }
+redis-serde = { version = "0.15" }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
 serial_test = "3.2"
+
+[[example]]
+name = "greeting"
+path = "examples/greeting.rs"
