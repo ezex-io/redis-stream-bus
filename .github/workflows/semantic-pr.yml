@@ -50,11 +50,22 @@ jobs:
 
       - name: Warn Missing Scope
         if: always() && !steps.lint_pr_title.outputs.scope
-        run: echo "::warning ::The PR title does not include a scope. Consider adding one for better clarity."
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-title-lint-no-scope
+          message: |
+            ::warning ::The PR title does not include a scope. Consider adding one for better clarity.
 
-      - name: Remove Sticky Comment on Fix
+      - name: Remove Sticky Comment on Fixing Error
         if: steps.lint_pr_title.outputs.error_message == null
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: pr-title-lint-error
+          delete: true
+
+      - name: Remove Sticky Comment on Fixing Scope
+        if: steps.lint_pr_title.outputs.scope
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-title-lint-no-scope
           delete: true
