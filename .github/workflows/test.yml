@@ -32,5 +32,5 @@ jobs:
       - name: Run Tests
         run: cargo test
 
-      - name: Run example
-        run: cargo run --example example
+      - name: Run examples
+        run: cargo run --example greeting
